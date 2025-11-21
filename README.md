@@ -46,7 +46,7 @@ EOF
 
 sudo chmod +x /var/git/mail/.git/hooks/post-receive
 ```
-Wichtig: Der Pfad `/var/git/mail`` muss exakt der sein, auf den dein SSH-User zugreift (also git@raspberry-intra:mail/…).
+Wichtig: Der Pfad `/var/git/mail` muss exakt der sein, auf den dein SSH-User zugreift (also git@raspberry-intra:mail/…).
 
 ## Script installieren
 ```sh

@@ -1,69 +1,102 @@
 #!/bin/bash
 # ===============================================================
-# Vollautomatisches Backup ALLER Maildirs → eigene Git-Repos
-# Läuft stündlich als User vmail
+# maildir-git-backup-all.sh – finale, config-basierte Version
+# Läuft als vmail (oder jeder andere User mit eigenem Config)
 # ===============================================================
-BASE="/mnt/eichert2/vmail"
-GIT_SERVER="git@raspberry-intra"           # SSH-Hostalias deines Raspberry Pi
-LOG="/var/log/maildir-git-backup-all.log"
 
-# Lock für das gesamte Script
-LOCK="/var/run/maildir-git-backup-all.lock"
+set -euo pipefail
+
+# ——— Wer bin ich? (damit mehrere User eigene Config haben können) ———
+RUN_USER="${SUDO_USER:-$(whoami)}"
+if [ "$RUN_USER" = "root" ] && [ -n "${SUDO_USER:-}" ]; then
+  RUN_USER="$SUDO_USER"
+fi
+
+# ——— Config finden – zuerst im Home des laufenden Users ———
+CONFIG_PATH=""
+for dir in "/home/$RUN_USER/.config" "$HOME/.config" "/etc/maildir-git-backup-all.conf"; do
+  if [ -f "$dir/maildir-git-backup-all.conf" ]; then
+    CONFIG_PATH="$dir/maildir-git-backup-all.conf"
+    break
+  fi
+done
+
+if [ -z "$CONFIG_PATH" ]; then
+  echo "FEHLER: Keine Config gefunden für User $RUN_USER" >&2
+  exit 1
+fi
+
+echo "Lade Config: $CONFIG_PATH"
+source "$CONFIG_PATH"
+
+# ——— Default-Werte falls nicht in Config ———
+: ${BASE:="/mnt/eichert2/vmail"}
+: ${GIT_SERVER:="git@raspberry-intra"}
+: ${LOG:="/var/log/maildir-git-backup-all.log"}
+: ${LOCK:="/var/run/maildir-git-backup-all.lock"}
+: ${FORCE_PUSH_EVERY:=24}
+
+# ——— Lock (pro Config, damit mehrere Instanzen parallel können) ———
 exec 200>"$LOCK"
-flock -n 200 || exit 0
-trap "rm -f $LOCK" EXIT
+flock -n 200 || { echo "$(date) – Backup läuft bereits" >> "$LOG"; exit 0; }
+trap "rm -f '$LOCK'" EXIT
 
-echo "=== $(date '+%Y-%m-%d %H:%M:%S') – Start Backup-Run ===" >> "$LOG"
+echo "=========================================================" >> "$LOG"
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') – Backup-Start als $RUN_USER ===" >> "$LOG"
 
-# Rekursiv alle Maildirs finden (nur die eigentlichen Benutzerordner)
-find "$BASE" -mindepth 2 -maxdepth 2 -type d | while read MAILDIR; do
+# Zähler für force-push
+COUNTER_FILE="$HOME/.cache/maildir-git-backup-counter"
+mkdir -p "$(dirname "$COUNTER_FILE")"
+if [ -f "$COUNTER_FILE" ]; then
+  COUNT=$(cat "$COUNTER_FILE")
+else
+  COUNT=0
+fi
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$COUNTER_FILE"
+
+find "$BASE" -mindepth 2 -maxdepth 2 -type d -print0 | while IFS= read -r -d '' MAILDIR; do
   DOMAIN=$(basename "$(dirname "$MAILDIR")")
   USER=$(basename "$MAILDIR")
-  REPO_NAME="${DOMAIN}-${USER}"                    # z. B. example.com-maxmustermann
-  REPO_PATH="$MAILDIR"
+  REPO_NAME="${DOMAIN}-${USER@Q}"  # @Q = quoted für seltsame Namen
   REMOTE="git@$GIT_SERVER:mail/$REPO_NAME.git"
 
-  echo "Bearbeite: $DOMAIN / $USER → $REPO_NAME" >> "$LOG"
+  echo "→ $DOMAIN / $USER ($REPO_NAME)" >> "$LOG"
 
-  cd "$REPO_PATH" || continue
+  cd "$MAILDIR"
 
-  # ---- Repo existiert noch nicht lokal? → initialisieren ----
+  # Repo initialisieren falls nötig
   if [ ! -d ".git" ]; then
-    echo "   → Initialisiere neues Repo für $REPO_NAME" >> "$LOG"
+    echo "   Initialisiere Repo: $REPO_NAME" >> "$LOG"
     git init -q
     git checkout -b main 2>/dev/null || true
-    echo -e "*.tmp\ncourier*\n*.lock\n*.log" > .gitignore
+    echo -e "*.tmp\ncourier*\n*.lock\n*.log\n.*.swp" > .gitignore
     git add .gitignore
-    git commit -q -m "Initial commit + .gitignore" 2>/dev/null || true
-    # Remote setzen (falls noch nicht da)
-    git remote | grep -q origin || git remote add origin "$REMOTE"
+    git commit -q -m "Initial commit" || true
+    git remote add origin "$REMOTE" 2>/dev oder true
   fi
 
-  # ---- Änderungen prüfen ----
   NEW=$(git ls-files --others --exclude-standard | wc -l)
   MOD=$(git diff --name-only HEAD 2>/dev/null | wc -l)
   TOTAL=$((NEW + MOD))
 
-  if [ $TOTAL -eq 0 ]; then
-    echo "   → $REPO_NAME: keine Änderungen" >> "$LOG"
-    continue
-  fi
+  [ $TOTAL -eq 0 ] && { echo "   keine Änderungen" >> "$LOG"; continue; }
 
-  # ---- Commit ----
   git add -A .
   NOW=$(date '+%Y-%m-%d %H:%M')
   git commit -q -m "Auto-Backup $NOW – +$NEW neue, $MOD geändert"
 
-  # ---- Push (erstellt das Remote-Repo automatisch, siehe Punkt 2) ----
-  if git push -q origin main 2>>"$LOG"; then
-    echo "   → $REPO_NAME: $TOTAL Dateien gesichert & gepusht" >> "$LOG"
+  PUSH_CMD="git push -q origin main"
+  [ $((COUNT % FORCE_PUSH_EVERY)) -eq 0 ] && PUSH_CMD="git push -q --force-with-lease origin main"
+
+  if $PUSH_CMD 2>>"$LOG"; then
+    echo "   $TOTAL Dateien gesichert & gepusht" >> "$LOG"
   else
-    echo "   → $REPO_NAME: Push fehlgeschlagen (erstes Mal? → Repo wird gleich angelegt)" >> "$LOG"
+    echo "   Push fehlschlag (Repo wird beim nächsten Mal angelegt)" >> "$LOG"
   fi
 
-  # Aufräumen
   git gc --quiet --auto 2>/dev/null
 done
 
-echo "=== Backup-Run fertig $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG"
+echo "=== Backup-Run fertig – $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG"
 echo "" >> "$LOG"
